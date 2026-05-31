@@ -5,7 +5,18 @@ description = "Super Resolution Neural Cellular Automata"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "kagglehub>=1.0.1",
     "opencv-python>=4.13.0.92",
+    "torch>=2.12.0",
     "tqdm>=4.67.3",
 ]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+
+[tool.uv.extra-build-dependencies]
+visdom = ["setuptools"]
