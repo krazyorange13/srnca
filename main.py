@@ -3,7 +3,6 @@ import sys
 import math
 import time
 from dataclasses import dataclass
-import tracemalloc
 
 import cv2
 import numpy as np
@@ -14,11 +13,61 @@ from torch import optim
 from torch import nn
 from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
+from torchvision.models import vgg19, VGG19_Weights
+from torchvision.transforms import Normalize
 
 from tqdm import tqdm
 
 
-tracemalloc.start()
+class VGGFeatureExtractor(nn.Module):
+    def __init__(self, slice=16):
+        super().__init__()
+        self.slice = slice
+
+        vgg = vgg19(weights=VGG19_Weights.DEFAULT).features
+        self.feature_extractor = vgg[:slice]  # type: ignore # :9, :16, :23, :36
+
+        for param in self.parameters():
+            param.requires_grad = False
+
+        # imagenet normalization
+        self.normalize = Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225],
+        )
+
+        self.eval()
+
+    def forward(self, x):
+        # (b, c, h, w) bgr to rgb
+        x = x[:, [2, 1, 0], :, :]
+
+        if x.shape[2] < 224 or x.shape[3] < 224:
+            x = F.interpolate(x, size=(224, 224), mode="bicubic", align_corners=False)
+
+        x = self.normalize(x)
+
+        return self.feature_extractor(x)
+
+
+class Discriminator(nn.Module):
+    def __init__(self):
+        super().__init__()
+        spectral_norm = nn.utils.parametrizations.spectral_norm
+        self.seq = nn.Sequential(
+            spectral_norm(nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1)),
+            nn.LeakyReLU(0.2, inplace=True),
+            spectral_norm(nn.Conv2d(64, 64, kernel_size=3, stride=2, padding=1)),
+            nn.LeakyReLU(0.2, inplace=True),
+            spectral_norm(nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1)),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(128, 1),
+        )
+
+    def forward(self, x):
+        return self.seq(x)
 
 
 class Sampler:
@@ -156,6 +205,8 @@ class SRNCAConfig:
     optim_lr: float = 1e-3
     optim_weight_decay: float = 0.01
     optim_lr_gamma: float = 0.999
+    vgg_slice: int = 16
+    gan_start: int = 400
 
 
 class SRNCA:
@@ -166,23 +217,41 @@ class SRNCA:
 
         self.sampler = Sampler(self.config.lr_dir, self.config.hr_dir, self.config.img_limit, self.config.nca_channels)
         self.nca = NCA(channels=self.config.nca_channels)
-        self.optimizer = optim.AdamW(self.nca.parameters(), lr=self.config.optim_lr, weight_decay=self.config.optim_weight_decay)
-        self.scheduler = optim.lr_scheduler.ExponentialLR(self.optimizer, self.config.optim_lr_gamma)
+        self.vgg = VGGFeatureExtractor(self.config.vgg_slice)
+        self.gan = Discriminator()
+        self.nca_optimizer = optim.AdamW(self.nca.parameters(), lr=self.config.optim_lr, weight_decay=self.config.optim_weight_decay)
+        self.gan_optimizer = optim.AdamW(self.gan.parameters(), lr=self.config.optim_lr, weight_decay=self.config.optim_weight_decay)
+        self.nca_scheduler = optim.lr_scheduler.ExponentialLR(self.nca_optimizer, self.config.optim_lr_gamma)
+        self.gan_scheduler = optim.lr_scheduler.ExponentialLR(self.gan_optimizer, self.config.optim_lr_gamma)
+
+        self.vgg_criterion = nn.MSELoss()
+        self.gan_criterion = nn.BCEWithLogitsLoss()
 
         self.min_loss = float("inf")
         self.min_model = ""
         self.last_model = ""
         self.curr_epoch = 0
         self.loaded_epoch = 0
-        self.acc_loss = 0
+        self.nca_acc_loss = 0
+        self.gan_acc_loss = 0
         self.acc_epochs = 0
 
         if state is not None:
             self.nca.load_state_dict(state["nca"])
-            self.optimizer.load_state_dict(state["optimizer"])
-            self.scheduler.load_state_dict(state["scheduler"])
+            self.vgg.load_state_dict(state["vgg"])
+            self.gan.load_state_dict(state["gan"])
+            self.nca_optimizer.load_state_dict(state["nca_optimizer"])
+            self.gan_optimizer.load_state_dict(state["gan_optimizer"])
+            self.nca_scheduler.load_state_dict(state["nca_scheduler"])
+            self.gan_scheduler.load_state_dict(state["gan_scheduler"])
             self.min_loss = state["min_loss"]
             self.loaded_epoch = state["epoch"]
+
+    def get_nca_steps_random(self):
+        return torch.randint(self.config.nca_steps[0], self.config.nca_steps[1], [1]).item()
+
+    def get_nca_steps_avg(self):
+        return (self.config.nca_steps[0] + self.config.nca_steps[1]) // 2
 
     def train(self):
         print(f"model: {self.config.model_name}")
@@ -203,61 +272,112 @@ class SRNCA:
 
     def loop(self):
         for i in tqdm(
-            range(0, self.config.epochs),
+            range(self.loaded_epoch, self.config.epochs),
             initial=self.loaded_epoch,
             total=self.config.epochs,
             leave=False,
             dynamic_ncols=True,
         ):
             self.curr_epoch = i
-            self.optimizer.zero_grad()
 
-            x, y = self.sampler.sample(self.config.batch_size, self.config.crop_size)
+            # nca (generator)
 
-            steps = torch.randint(self.config.nca_steps[0], self.config.nca_steps[1], [1]).item()
-            # tqdm.write(f"{i}\trun nca")
+            tqdm.write(f"{i}\tgenerate NCA")
+            x, hr_imgs = self.sampler.sample(self.config.batch_size, self.config.crop_size)
+            steps = self.get_nca_steps_random()
             x = self.nca(x, steps)
-            loss = F.mse_loss(x[:, :3, :, :], y)
-            # tqdm.write(f"{i}\trun loss backprop")
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.nca.parameters(), max_norm=1.0)
-            # tqdm.write(f"{i}\trun optim")
-            self.optimizer.step()
-            self.scheduler.step()
+            sr_imgs = x[:, :3, :, :]
 
-            self.acc_loss += loss.item()
+            # optimize gan (discriminator)
+
+            if self.curr_epoch >= self.config.gan_start:
+                tqdm.write(f"{i}\toptimize GAN")
+                self.gan_optimizer.zero_grad()
+                hr_preds = self.gan(hr_imgs)
+                hr_loss = self.gan_criterion(hr_preds, torch.ones_like(hr_preds))
+                sr_preds = self.gan(sr_imgs.detach())
+                sr_loss = self.gan_criterion(sr_preds, torch.zeros_like(sr_preds))
+                gan_loss = (hr_loss + sr_loss) / 2
+                gan_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.gan.parameters(), max_norm=1.0)
+                self.gan_optimizer.step()
+                self.gan_scheduler.step()
+            else:
+                gan_loss = torch.tensor([0])
+
+            # optimize nca
+
+            self.nca_optimizer.zero_grad()
+
+            if self.curr_epoch < self.config.gan_start:
+                tqdm.write(f"{i}\toptimize NCA (L2)")
+                nca_loss = F.mse_loss(sr_imgs, hr_imgs)
+                nca_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.nca.parameters(), max_norm=1.0)
+                self.nca_optimizer.step()
+                self.nca_scheduler.step()
+            else:
+                tqdm.write(f"{i}\toptimize NCA (VGG + GAN)")
+                sr_preds_for_nca = self.gan(sr_imgs)
+                gan_loss_for_nca = self.gan_criterion(sr_preds_for_nca, torch.ones_like(sr_preds_for_nca))
+                hr_vgg = self.vgg(hr_imgs)
+                sr_vgg = self.vgg(sr_imgs)
+                vgg_loss = self.vgg_criterion(sr_vgg, hr_vgg)
+                nca_loss = vgg_loss + (1e-3 * gan_loss_for_nca)
+                nca_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.nca.parameters(), max_norm=1.0)
+                self.nca_optimizer.step()
+                self.nca_scheduler.step()
+
+            # tracking
+
+            self.gan_acc_loss += gan_loss.item()
+            self.nca_acc_loss += nca_loss.item()
             self.acc_epochs += 1
 
-            # tqdm.write(f"{i}\tloss {loss.item()}")
             if vis:
                 vis.line(
                     X=[self.curr_epoch],
-                    Y=[loss.item()],
-                    win="loss",
+                    Y=[nca_loss.item()],
+                    win="nca_loss",
+                    update="append" if self.curr_epoch > 0 else None,
+                )
+                vis.line(
+                    X=[self.curr_epoch],
+                    Y=[gan_loss.item()],
+                    win="gan_loss",
                     update="append" if self.curr_epoch > 0 else None,
                 )
 
             if self.curr_epoch % 100 == 99:
-                avg_loss = self.acc_loss / self.acc_epochs
-                tqdm.write(f"epoch {self.curr_epoch + 1} loss: {avg_loss}")
-                if avg_loss < self.min_loss:
+                nca_avg_loss = self.nca_acc_loss / self.acc_epochs
+                gan_avg_loss = self.gan_acc_loss / self.acc_epochs
+                tqdm.write(f"epoch {self.curr_epoch + 1} nca loss: {nca_avg_loss} gan loss: {gan_avg_loss}")
+
+                if nca_avg_loss < self.min_loss:
                     if self.min_model and self.min_model != self.last_model:
                         os.remove(self.min_model)
-                    self.min_loss = avg_loss
+                    self.min_loss = nca_avg_loss
                     self.min_model = self.save()
-                if not math.isnan(avg_loss):
+                if not math.isnan(nca_avg_loss):
                     if self.last_model and self.min_model != self.last_model:
                         os.remove(self.last_model)
                     self.last_model = self.save()
-                self.acc_loss = 0
+
+                self.gan_acc_loss = 0
+                self.nca_acc_loss = 0
                 self.acc_epochs = 0
 
     def save(self):
         state = {
             "config": self.config,
             "nca": self.nca.state_dict(),
-            "optimizer": self.optimizer.state_dict(),
-            "scheduler": self.scheduler.state_dict(),
+            "vgg": self.vgg.state_dict(),
+            "gan": self.gan.state_dict(),
+            "nca_optimizer": self.nca_optimizer.state_dict(),
+            "gan_optimizer": self.gan_optimizer.state_dict(),
+            "nca_scheduler": self.nca_scheduler.state_dict(),
+            "gan_scheduler": self.gan_scheduler.state_dict(),
             "min_loss": self.min_loss,
             "epoch": self.curr_epoch,
         }
@@ -286,7 +406,7 @@ if __name__ == "__main__":
 
     else:
         config = SRNCAConfig(
-            model_name="delta",
+            model_name="epsilon",
             model_dir="models",
             hr_dir="data/hr",
             lr_dir="data/lr",
@@ -300,6 +420,8 @@ if __name__ == "__main__":
             optim_lr=1e-3,
             optim_weight_decay=0.01,
             optim_lr_gamma=0.9997,
+            vgg_slice=16,
+            gan_start=0,
         )
         srnca = SRNCA(config, None, vis)
 
