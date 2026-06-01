@@ -1,10 +1,11 @@
 import sys
 
 import cv2
+import numpy as np
 import torch
 import torch.nn.functional as F
 
-from main import SRNCA, SRNCAConfig, Sampler
+from main import SRNCA, NCA, SRNCAConfig, Sampler
 
 
 class Visualization:
@@ -24,21 +25,30 @@ class Visualization:
         self.steps = steps
         self.update_rate = update_rate
 
+        print(f"model: {self.model_path}")
+        print(f"LR img: {self.lr_path}")
+        if self.hr_path:
+            print(f"HR img: {self.hr_path}")
+        if self.out_path:
+            print(f"SR img: {self.out_path}")
+
         state = torch.load(model_path, weights_only=False)
         self.config: SRNCAConfig = state["config"]
 
+        # self.nca = NCA(channels=self.config.nca_channels, update_rate=self.config.nca_update_rate)
         self.srnca = SRNCA(self.config, state, None)
 
     def viz(self):
         x = self.img_to_nca(self.lr_path)
         print("upscaling... ", end="", flush=True)
         with torch.no_grad():
-            x = self.srnca.nca(x, steps=self.steps)
+            steps = (self.config.nca_steps[0] + self.config.nca_steps[1]) // 2
+            x = self.srnca.nca(x, steps=steps)
         print("done!")
         img = self.nca_to_img(x)
 
         if self.out_path:
-            cv2.imwrite(self.out_path, img)
+            cv2.imwrite(self.out_path, (img * 255).astype(np.uint8))
 
         print(self.lr_path, self.hr_path, self.out_path)
 
@@ -73,7 +83,7 @@ class Visualization:
         img_t = torch.cat([img_t, hid], dim=1)
 
         # upscale
-        img_t = F.interpolate(img_t, scale_factor=2, mode="bilinear")
+        img_t = F.interpolate(img_t, scale_factor=2, mode="nearest")
 
         return img_t
 

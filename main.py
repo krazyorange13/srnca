@@ -50,7 +50,7 @@ class Sampler:
         self.x_batch = torch.cat([self.x_batch, hid], dim=1)
 
         # upscale
-        self.x_batch = F.interpolate(self.x_batch, scale_factor=2, mode="bilinear")
+        self.x_batch = F.interpolate(self.x_batch, scale_factor=2, mode="nearest")
 
         # crop
         top = torch.randint(0, _h - crop_size + 1, (1,)).item()
@@ -150,7 +150,9 @@ class SRNCAConfig:
     epochs: int
     batch_size: int
     crop_size: int
+    nca_steps: tuple[int, int]
     nca_channels: int = 16
+    nca_update_rate: float = 0.5
     optim_lr: float = 1e-3
     optim_weight_decay: float = 0.01
     optim_lr_gamma: float = 0.999
@@ -212,7 +214,7 @@ class SRNCA:
 
             x, y = self.sampler.sample(self.config.batch_size, self.config.crop_size)
 
-            steps = torch.randint(8, 16, [1]).item()
+            steps = torch.randint(self.config.nca_steps[0], self.config.nca_steps[1], [1]).item()
             # tqdm.write(f"{i}\trun nca")
             x = self.nca(x, steps)
             loss = F.mse_loss(x[:, :3, :, :], y)
@@ -284,18 +286,20 @@ if __name__ == "__main__":
 
     else:
         config = SRNCAConfig(
-            model_name="alpha",
+            model_name="delta",
             model_dir="models",
             hr_dir="data/hr",
             lr_dir="data/lr",
-            img_limit=100,
-            epochs=1000,
+            img_limit=1000,
+            epochs=10000,
             batch_size=8,
-            crop_size=64,
-            nca_channels=8,
+            crop_size=80,
+            nca_steps=(48, 64),
+            nca_channels=12,
+            nca_update_rate=0.5,
             optim_lr=1e-3,
             optim_weight_decay=0.01,
-            optim_lr_gamma=0.997,
+            optim_lr_gamma=0.9997,
         )
         srnca = SRNCA(config, None, vis)
 
