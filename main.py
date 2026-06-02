@@ -61,6 +61,8 @@ class Discriminator(nn.Module):
             nn.LeakyReLU(0.2, inplace=True),
             spectral_norm(nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1)),
             nn.LeakyReLU(0.2, inplace=True),
+            spectral_norm(nn.Conv2d(128, 128, kernel_size=3, stride=2, padding=1)),
+            nn.LeakyReLU(0.2, inplace=True),
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
             nn.Linear(128, 1),
@@ -202,11 +204,19 @@ class SRNCAConfig:
     nca_steps: tuple[int, int]
     nca_channels: int = 16
     nca_update_rate: float = 0.5
-    optim_lr: float = 1e-3
-    optim_weight_decay: float = 0.01
-    optim_lr_gamma: float = 0.999
+    nca_optim_lr: float = 1e-4
+    nca_optim_lr_gamma: float = 0.99995
+    nca_optim_weight_decay: float = 1e-4
+    nca_optim_betas: tuple[float, float] = (0.0, 0.999)
+    gan_optim_lr: float = 2e-4
+    gan_optim_lr_gamma: float = 0.99995
+    gan_optim_weight_decay: float = 0.0
+    gan_optim_betas: tuple[float, float] = (0.0, 0.999)
     vgg_slice: int = 16
     gan_start: int = 400
+    lambda_pxl: float = 1.0
+    lambda_vgg: float = 1.0
+    lambda_gan: float = 1e-3
 
 
 class SRNCA:
@@ -219,11 +229,12 @@ class SRNCA:
         self.nca = NCA(channels=self.config.nca_channels)
         self.vgg = VGGFeatureExtractor(self.config.vgg_slice)
         self.gan = Discriminator()
-        self.nca_optimizer = optim.AdamW(self.nca.parameters(), lr=self.config.optim_lr, weight_decay=self.config.optim_weight_decay)
-        self.gan_optimizer = optim.AdamW(self.gan.parameters(), lr=self.config.optim_lr, weight_decay=self.config.optim_weight_decay)
-        self.nca_scheduler = optim.lr_scheduler.ExponentialLR(self.nca_optimizer, self.config.optim_lr_gamma)
-        self.gan_scheduler = optim.lr_scheduler.ExponentialLR(self.gan_optimizer, self.config.optim_lr_gamma)
+        self.nca_optimizer = optim.AdamW(self.nca.parameters(), lr=self.config.nca_optim_lr, weight_decay=self.config.nca_optim_weight_decay, betas=self.config.nca_optim_betas)
+        self.gan_optimizer = optim.AdamW(self.gan.parameters(), lr=self.config.gan_optim_lr, weight_decay=self.config.gan_optim_weight_decay, betas=self.config.gan_optim_betas)
+        self.nca_scheduler = optim.lr_scheduler.ExponentialLR(self.nca_optimizer, self.config.nca_optim_lr_gamma)
+        self.gan_scheduler = optim.lr_scheduler.ExponentialLR(self.gan_optimizer, self.config.gan_optim_lr_gamma)
 
+        self.pxl_criterion = nn.L1Loss()
         self.vgg_criterion = nn.MSELoss()
         self.gan_criterion = nn.BCEWithLogitsLoss()
 
@@ -282,7 +293,7 @@ class SRNCA:
 
             # nca (generator)
 
-            tqdm.write(f"{i}\tgenerate NCA")
+            # tqdm.write(f"{i}\tgenerate NCA")
             x, hr_imgs = self.sampler.sample(self.config.batch_size, self.config.crop_size)
             steps = self.get_nca_steps_random()
             x = self.nca(x, steps)
@@ -291,13 +302,16 @@ class SRNCA:
             # optimize gan (discriminator)
 
             if self.curr_epoch >= self.config.gan_start:
-                tqdm.write(f"{i}\toptimize GAN")
+                # tqdm.write(f"{i}\toptimize GAN")
                 self.gan_optimizer.zero_grad()
                 hr_preds = self.gan(hr_imgs)
-                hr_loss = self.gan_criterion(hr_preds, torch.ones_like(hr_preds))
                 sr_preds = self.gan(sr_imgs.detach())
-                sr_loss = self.gan_criterion(sr_preds, torch.zeros_like(sr_preds))
-                gan_loss = (hr_loss + sr_loss) / 2
+                # hr_loss = self.gan_criterion(hr_preds, torch.ones_like(hr_preds))
+                # sr_loss = self.gan_criterion(sr_preds, torch.zeros_like(sr_preds))
+                # gan_loss = (hr_loss + sr_loss) / 2
+                hr_loss = torch.mean(torch.relu(1.0 - hr_preds))
+                sr_loss = torch.mean(torch.relu(1.0 + sr_preds))
+                gan_loss = hr_loss + sr_loss
                 gan_loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.gan.parameters(), max_norm=1.0)
                 self.gan_optimizer.step()
@@ -310,20 +324,22 @@ class SRNCA:
             self.nca_optimizer.zero_grad()
 
             if self.curr_epoch < self.config.gan_start:
-                tqdm.write(f"{i}\toptimize NCA (L2)")
-                nca_loss = F.mse_loss(sr_imgs, hr_imgs)
+                # tqdm.write(f"{i}\toptimize NCA (L2)")
+                nca_loss = self.pxl_criterion(sr_imgs, hr_imgs)
                 nca_loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.nca.parameters(), max_norm=1.0)
                 self.nca_optimizer.step()
                 self.nca_scheduler.step()
             else:
-                tqdm.write(f"{i}\toptimize NCA (VGG + GAN)")
+                # tqdm.write(f"{i}\toptimize NCA (VGG + GAN)")
+                pxl_loss = self.pxl_criterion(sr_imgs, hr_imgs)
                 sr_preds_for_nca = self.gan(sr_imgs)
-                gan_loss_for_nca = self.gan_criterion(sr_preds_for_nca, torch.ones_like(sr_preds_for_nca))
+                # gan_loss_for_nca = self.gan_criterion(sr_preds_for_nca, torch.ones_like(sr_preds_for_nca))
+                gan_loss_for_nca = -torch.mean(sr_preds_for_nca)
                 hr_vgg = self.vgg(hr_imgs)
                 sr_vgg = self.vgg(sr_imgs)
                 vgg_loss = self.vgg_criterion(sr_vgg, hr_vgg)
-                nca_loss = vgg_loss + (1e-3 * gan_loss_for_nca)
+                nca_loss = (pxl_loss * self.config.lambda_pxl) + (vgg_loss * self.config.lambda_vgg) + (gan_loss_for_nca * self.config.lambda_gan)
                 nca_loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.nca.parameters(), max_norm=1.0)
                 self.nca_optimizer.step()
@@ -334,6 +350,12 @@ class SRNCA:
             self.gan_acc_loss += gan_loss.item()
             self.nca_acc_loss += nca_loss.item()
             self.acc_epochs += 1
+
+            # started VGG + GAN training, reset loss baseline
+            if self.curr_epoch == self.config.gan_start:
+                self.min_loss = float("inf")
+                self.min_model = ""
+                self.last_model = ""
 
             if vis:
                 vis.line(
@@ -406,7 +428,7 @@ if __name__ == "__main__":
 
     else:
         config = SRNCAConfig(
-            model_name="epsilon",
+            model_name="zeta",
             model_dir="models",
             hr_dir="data/hr",
             lr_dir="data/lr",
@@ -417,11 +439,19 @@ if __name__ == "__main__":
             nca_steps=(48, 64),
             nca_channels=12,
             nca_update_rate=0.5,
-            optim_lr=1e-3,
-            optim_weight_decay=0.01,
-            optim_lr_gamma=0.9997,
+            nca_optim_lr=1e-4,
+            nca_optim_lr_gamma=0.99995,
+            nca_optim_weight_decay=1e-4,
+            nca_optim_betas=(0.0, 0.999),
+            gan_optim_lr=2e-4,
+            gan_optim_lr_gamma=0.99995,
+            gan_optim_weight_decay=0.0,
+            gan_optim_betas=(0.0, 0.999),
             vgg_slice=16,
-            gan_start=0,
+            gan_start=400,
+            lambda_pxl=1.0,
+            lambda_vgg=1.0,
+            lambda_gan=1e-3,
         )
         srnca = SRNCA(config, None, vis)
 
