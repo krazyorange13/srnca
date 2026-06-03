@@ -51,21 +51,24 @@ class VGGFeatureExtractor(nn.Module):
 
 
 class Discriminator(nn.Module):
-    def __init__(self):
+    def __init__(self, in_channels=3, features=64):
         super().__init__()
+        self.in_channels = in_channels
+        self.features = features
         spectral_norm = nn.utils.parametrizations.spectral_norm
+
         self.seq = nn.Sequential(
-            spectral_norm(nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1)),
+            spectral_norm(nn.Conv2d(self.in_channels, self.features, kernel_size=4, stride=2, padding=1)),
             nn.LeakyReLU(0.2, inplace=True),
-            spectral_norm(nn.Conv2d(64, 64, kernel_size=3, stride=2, padding=1)),
+            spectral_norm(nn.Conv2d(self.features, self.features * 2, kernel_size=4, stride=2, padding=1)),
             nn.LeakyReLU(0.2, inplace=True),
-            spectral_norm(nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1)),
+            spectral_norm(nn.Conv2d(self.features * 2, self.features * 4, kernel_size=4, stride=2, padding=1)),
             nn.LeakyReLU(0.2, inplace=True),
-            spectral_norm(nn.Conv2d(128, 128, kernel_size=3, stride=2, padding=1)),
+            spectral_norm(nn.Conv2d(self.features * 4, self.features * 8, kernel_size=4, stride=2, padding=1)),
             nn.LeakyReLU(0.2, inplace=True),
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
-            nn.Linear(128, 1),
+            spectral_norm(nn.Linear(self.features * 8, 1)),
         )
 
     def forward(self, x):
@@ -153,6 +156,8 @@ class NCA(nn.Module):
 
         self.seq = nn.Sequential(
             nn.Conv2d(self.perception.out_channels, 256, kernel_size=1),
+            nn.LeakyReLU(inplace=True),
+            nn.Conv2d(256, 256, kernel_size=1),
             nn.LeakyReLU(inplace=True),
             nn.Conv2d(256, 256, kernel_size=1),
             nn.LeakyReLU(inplace=True),
@@ -317,6 +322,8 @@ class SRNCA:
                 self.gan_optimizer.step()
                 self.gan_scheduler.step()
             else:
+                hr_loss = torch.tensor([0])
+                sr_loss = torch.tensor([0])
                 gan_loss = torch.tensor([0])
 
             # optimize nca
@@ -325,6 +332,9 @@ class SRNCA:
 
             if self.curr_epoch < self.config.gan_start:
                 # tqdm.write(f"{i}\toptimize NCA (L2)")
+                pxl_loss = torch.tensor([0])
+                vgg_loss = torch.tensor([0])
+                gan_loss_for_nca = torch.tensor([0])
                 nca_loss = self.pxl_criterion(sr_imgs, hr_imgs)
                 nca_loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.nca.parameters(), max_norm=1.0)
@@ -339,6 +349,7 @@ class SRNCA:
                 hr_vgg = self.vgg(hr_imgs)
                 sr_vgg = self.vgg(sr_imgs)
                 vgg_loss = self.vgg_criterion(sr_vgg, hr_vgg)
+                # tqdm.write(f"nca losses (unweighted) pxl: {pxl_loss} vgg: {vgg_loss} gan: {gan_loss_for_nca}")
                 nca_loss = (pxl_loss * self.config.lambda_pxl) + (vgg_loss * self.config.lambda_vgg) + (gan_loss_for_nca * self.config.lambda_gan)
                 nca_loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.nca.parameters(), max_norm=1.0)
@@ -360,15 +371,23 @@ class SRNCA:
             if vis:
                 vis.line(
                     X=[self.curr_epoch],
-                    Y=[nca_loss.item()],
+                    Y=np.column_stack([nca_loss.item(), pxl_loss.detach() * self.config.lambda_pxl, vgg_loss.detach() * self.config.lambda_vgg, gan_loss_for_nca.detach() * self.config.lambda_gan]),
                     win="nca_loss",
                     update="append" if self.curr_epoch > 0 else None,
+                    opts=dict(
+                        legend=["nca_loss", "pxl_loss", "vgg_loss", "gan_loss_for_nca"],
+                        linecolor=np.array([[0, 2, 73], [15, 67, 146], [255, 73, 73], [221, 23, 23]]),
+                    ),
                 )
                 vis.line(
                     X=[self.curr_epoch],
-                    Y=[gan_loss.item()],
+                    Y=np.column_stack([gan_loss.item(), hr_loss.detach(), sr_loss.detach()]),
                     win="gan_loss",
                     update="append" if self.curr_epoch > 0 else None,
+                    opts=dict(
+                        legend=["gan_loss", "hr_loss", "sr_loss"],
+                        linecolor=np.array([[0, 2, 73], [255, 73, 73], [221, 23, 23]]),
+                    ),
                 )
 
             if self.curr_epoch % 100 == 99:
@@ -428,7 +447,7 @@ if __name__ == "__main__":
 
     else:
         config = SRNCAConfig(
-            model_name="zeta",
+            model_name="theta",
             model_dir="models",
             hr_dir="data/hr",
             lr_dir="data/lr",
@@ -437,7 +456,7 @@ if __name__ == "__main__":
             batch_size=8,
             crop_size=80,
             nca_steps=(48, 64),
-            nca_channels=12,
+            nca_channels=16,
             nca_update_rate=0.5,
             nca_optim_lr=1e-4,
             nca_optim_lr_gamma=0.99995,
@@ -448,10 +467,10 @@ if __name__ == "__main__":
             gan_optim_weight_decay=0.0,
             gan_optim_betas=(0.0, 0.999),
             vgg_slice=16,
-            gan_start=400,
+            gan_start=0,
             lambda_pxl=1.0,
-            lambda_vgg=1.0,
-            lambda_gan=1e-3,
+            lambda_vgg=1e-2,
+            lambda_gan=1e-2,
         )
         srnca = SRNCA(config, None, vis)
 
