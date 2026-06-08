@@ -51,7 +51,7 @@ class VGGFeatureExtractor(nn.Module):
 
 
 class Discriminator(nn.Module):
-    def __init__(self, in_channels=3, features=64):
+    def __init__(self, in_channels=3, features=128):
         super().__init__()
         self.in_channels = in_channels
         self.features = features
@@ -447,7 +447,7 @@ if __name__ == "__main__":
 
     else:
         config = SRNCAConfig(
-            model_name="theta",
+            model_name="eta",
             model_dir="models",
             hr_dir="data/hr",
             lr_dir="data/lr",
@@ -459,11 +459,11 @@ if __name__ == "__main__":
             nca_channels=16,
             nca_update_rate=0.5,
             nca_optim_lr=1e-4,
-            nca_optim_lr_gamma=0.99995,
+            nca_optim_lr_gamma=0.99999,
             nca_optim_weight_decay=1e-4,
             nca_optim_betas=(0.0, 0.999),
             gan_optim_lr=2e-4,
-            gan_optim_lr_gamma=0.99995,
+            gan_optim_lr_gamma=0.99999,
             gan_optim_weight_decay=0.0,
             gan_optim_betas=(0.0, 0.999),
             vgg_slice=16,
