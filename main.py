@@ -447,7 +447,7 @@ if __name__ == "__main__":
 
     else:
         config = SRNCAConfig(
-            model_name="eta",
+            model_name="iota",
             model_dir="models",
             hr_dir="data/hr",
             lr_dir="data/lr",
@@ -468,9 +468,9 @@ if __name__ == "__main__":
             gan_optim_betas=(0.0, 0.999),
             vgg_slice=16,
             gan_start=0,
-            lambda_pxl=1.0,
+            lambda_pxl=1e-0,
             lambda_vgg=1e-2,
-            lambda_gan=1e-2,
+            lambda_gan=1e-0,
         )
         srnca = SRNCA(config, None, vis)
 
